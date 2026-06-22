@@ -1,0 +1,8 @@
+aiogram>=3.13,<4
+Telethon>=1.36,<2
+aiosqlite>=0.20,<1
+cryptography>=42,<47
+python-dotenv>=1.0,<2
+qrcode[pil]>=7.4,<9
+PySocks>=1.7,<2
+python-socks[asyncio]>=2.4,<3
