@@ -20,6 +20,7 @@ class Config:
     media_dir: Path
     publish_check_seconds: int
     telethon_proxy_url: str | None
+    bot_api_base_url: str | None
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -41,6 +42,7 @@ class Config:
         media_dir = Path(os.getenv("MEDIA_DIR", "./data/media"))
         publish_check_seconds = int(os.getenv("PUBLISH_CHECK_SECONDS", "60"))
         telethon_proxy_url = os.getenv("TELETHON_PROXY_URL", "").strip() or None
+        bot_api_base_url = os.getenv("BOT_API_BASE_URL", "").strip() or None
 
         return cls(
             bot_token=bot_token,
@@ -52,6 +54,7 @@ class Config:
             media_dir=media_dir,
             publish_check_seconds=publish_check_seconds,
             telethon_proxy_url=telethon_proxy_url,
+            bot_api_base_url=bot_api_base_url,
         )
 
     def is_admin(self, user_id: int | None) -> bool:

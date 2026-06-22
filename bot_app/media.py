@@ -14,8 +14,9 @@ MAX_STORY_BYTES = 30 * 1024 * 1024
 MAX_BOT_DOWNLOAD_BYTES = 20 * 1024 * 1024
 MAX_STORY_VIDEO_SECONDS = 60
 STORY_VIDEO_SPLIT_SECONDS = 59
-VIDEO_TARGET_BITRATE = "850k"
-VIDEO_TARGET_BUFSIZE = "1700k"
+VIDEO_TARGET_BITRATE = "4000k"
+VIDEO_TARGET_BUFSIZE = "8000k"
+VIDEO_CRF = "20"
 
 
 async def build_story_media(client, media_path: str, media_kind: str):
@@ -79,6 +80,12 @@ def ensure_story_file(path: Path) -> None:
         raise ValueError("Telegram Stories поддерживает медиа до 30 MB.")
 
 
+def bot_download_limit_bytes(bot_api_base_url: str | None) -> int | None:
+    if bot_api_base_url and bot_api_base_url.strip():
+        return None
+    return MAX_BOT_DOWNLOAD_BYTES
+
+
 def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
 
@@ -131,17 +138,17 @@ def normalize_video_command(source: Path, output: Path, start: int, duration: in
         "-map",
         "0:a?",
         "-vf",
-        "scale=608:1080:force_original_aspect_ratio=decrease,pad=608:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30",
+        "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30",
         "-c:v",
         "libx264",
         "-preset",
-        "superfast",
+        "medium",
         "-profile:v",
         "high",
         "-level",
-        "3.1",
+        "4.1",
         "-crf",
-        "30",
+        VIDEO_CRF,
         "-maxrate",
         VIDEO_TARGET_BITRATE,
         "-bufsize",
@@ -151,7 +158,7 @@ def normalize_video_command(source: Path, output: Path, start: int, duration: in
         "-c:a",
         "aac",
         "-b:a",
-        "96k",
+        "160k",
         "-ar",
         "44100",
         "-movflags",

@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 import qrcode
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -39,11 +40,13 @@ from bot_app.config import Config
 from bot_app.db import Database, now_ts
 from bot_app.media import (
     MAX_BOT_DOWNLOAD_BYTES,
+    bot_download_limit_bytes,
     ensure_story_file,
     split_story_video,
 )
 from bot_app.scheduler import StoryScheduler
 from bot_app.security import SessionCipher
+from bot_app.source_links import TelegramMessageLink, parse_telegram_message_link
 from bot_app.telegram_stories import ALLOWED_PERIOD_HOURS, user_client
 
 logger = logging.getLogger(__name__)
@@ -79,7 +82,10 @@ async def run() -> None:
     config.media_dir.mkdir(parents=True, exist_ok=True)
 
     cipher = SessionCipher(config.fernet_key)
-    bot_session = AiohttpSession()
+    bot_session_kwargs = {}
+    if config.bot_api_base_url:
+        bot_session_kwargs["api"] = TelegramAPIServer.from_base(config.bot_api_base_url)
+    bot_session = AiohttpSession(**bot_session_kwargs)
     bot_session._connector_init["family"] = socket.AF_INET
     bot = Bot(config.bot_token, session=bot_session)
     dp = Dispatcher(storage=MemoryStorage())
@@ -726,7 +732,8 @@ async def upload_period_callback(callback: CallbackQuery, config: Config, state:
     await state.set_state(UploadStory.media)
     await state.update_data(account_id=int(account_id_raw), period_hours=int(period_raw))
     await callback.message.edit_text(
-        "Теперь отправь фото или видео для Stories. Подпись к сообщению станет подписью Story.",
+        "Теперь отправь фото/видео для Stories или ссылку на сообщение из Telegram-канала с исходником. "
+        "Подпись к сообщению станет подписью Story.",
         reply_markup=back_keyboard(),
     )
     await callback.answer()
@@ -738,6 +745,7 @@ async def upload_media(
     bot: Bot,
     config: Config,
     db: Database,
+    cipher: SessionCipher,
     state: FSMContext,
 ) -> None:
     if not await require_admin_message(message, config):
@@ -752,6 +760,9 @@ async def upload_media(
         await message.answer("Аккаунт не найден.", reply_markup=main_menu())
         return
 
+    source_link: TelegramMessageLink | None = None
+    caption = message.caption
+
     if message.photo:
         media = message.photo[-1]
         media_kind = "photo"
@@ -760,36 +771,70 @@ async def upload_media(
         media = message.video
         media_kind = "video"
         ext = guess_video_ext(message.video.file_name)
+    elif message.text:
+        source_link = parse_telegram_message_link(message.text)
+        if source_link is None:
+            await message.answer("Нужно отправить фото, видео или ссылку на сообщение Telegram с исходником.")
+            return
+        media = None
+        media_kind = "video"
+        ext = ".mp4"
     else:
-        await message.answer("Нужно отправить фото или видео.")
-        return
-
-    file_size = getattr(media, "file_size", None)
-    if file_size and file_size > MAX_BOT_DOWNLOAD_BYTES:
-        await message.answer(
-            "Файл слишком большой для загрузки через Bot API.\n"
-            f"Размер: {format_bytes(file_size)}. Максимум: {format_bytes(MAX_BOT_DOWNLOAD_BYTES)}.\n"
-            "Сожми видео и отправь файл поменьше."
-        )
+        await message.answer("Нужно отправить фото, видео или ссылку на сообщение Telegram с исходником.")
         return
 
     config.media_dir.mkdir(parents=True, exist_ok=True)
     destination = config.media_dir / f"{uuid.uuid4().hex}{ext}"
-    try:
-        await bot.download(media, destination=destination)
-    except TelegramBadRequest as exc:
-        destination.unlink(missing_ok=True)
-        await message.answer(f"Telegram не дал скачать файл: {exc.message}")
-        return
+    if source_link is None:
+        file_size = getattr(media, "file_size", None)
+        download_limit = bot_download_limit_bytes(config.bot_api_base_url)
+        if file_size and download_limit and file_size > download_limit:
+            await message.answer(
+                "Файл слишком большой для загрузки через Bot API.\n"
+                f"Размер: {format_bytes(file_size)}. Максимум: {format_bytes(MAX_BOT_DOWNLOAD_BYTES)}.\n"
+                "Для больших исходников отправь ссылку на сообщение из Telegram-канала с этим видео."
+            )
+            return
+
+        try:
+            await bot.download(media, destination=destination)
+        except TelegramBadRequest as exc:
+            destination.unlink(missing_ok=True)
+            await message.answer(f"Telegram не дал скачать файл: {exc.message}")
+            return
+    else:
+        await message.answer("Скачиваю исходник по ссылке через подключенный аккаунт.")
+        try:
+            session = cipher.decrypt(account["session_encrypted"])
+            async with user_client(
+                config.api_id,
+                config.api_hash,
+                session,
+                proxy=config.telethon_proxy(),
+            ) as client:
+                destination, media_kind, caption = await download_source_message_media(
+                    client=client,
+                    source_link=source_link,
+                    media_dir=config.media_dir,
+                )
+        except Exception as exc:
+            destination.unlink(missing_ok=True)
+            await message.answer(
+                "Не удалось скачать исходник по ссылке.\n"
+                "Проверь, что выбранный аккаунт состоит в этом канале и видит сообщение.\n"
+                f"Ошибка: {exc}"
+            )
+            return
 
     if media_kind == "video":
         await message.answer("Видео загружено. Готовлю файл для Stories, это может занять немного времени.")
 
     try:
-        ensure_story_file(destination)
         media_paths = [destination]
         if media_kind == "video":
             media_paths = split_story_video(destination, config.media_dir / "parts")
+        else:
+            ensure_story_file(destination)
     except ValueError as exc:
         destination.unlink(missing_ok=True)
         await message.answer(str(exc))
@@ -804,7 +849,7 @@ async def upload_media(
         account_id=account_id,
         media_paths=[str(path) for path in media_paths],
         media_kind=media_kind,
-        caption=message.caption,
+        caption=caption,
         period_hours=period_hours,
     )
     await state.clear()
@@ -1243,6 +1288,38 @@ def guess_video_ext(file_name: str | None) -> str:
         return ".mp4"
     suffix = Path(file_name).suffix.lower()
     return suffix if suffix in {".mp4", ".mov", ".m4v"} else ".mp4"
+
+
+async def download_source_message_media(
+    client,
+    source_link: TelegramMessageLink,
+    media_dir: Path,
+) -> tuple[Path, str, str | None]:
+    source_message = await client.get_messages(source_link.chat_ref, ids=source_link.message_id)
+    if not source_message or not getattr(source_message, "media", None):
+        raise ValueError("в сообщении нет медиа")
+
+    file_info = getattr(source_message, "file", None)
+    mime_type = (getattr(file_info, "mime_type", None) or "").lower()
+    file_name = getattr(file_info, "name", None)
+    file_ext = (getattr(file_info, "ext", None) or "").lower()
+
+    if getattr(source_message, "photo", None):
+        media_kind = "photo"
+        ext = ".jpg"
+    elif getattr(source_message, "video", None) or mime_type.startswith("video/"):
+        media_kind = "video"
+        ext = guess_video_ext(file_name) if file_name else (file_ext if file_ext in {".mp4", ".mov", ".m4v"} else ".mp4")
+    else:
+        raise ValueError("поддерживаются только фото и видео")
+
+    destination = media_dir / f"{uuid.uuid4().hex}{ext}"
+    downloaded = await client.download_media(source_message, file=str(destination))
+    if not downloaded:
+        raise ValueError("Telegram не вернул файл после скачивания")
+
+    caption = (getattr(source_message, "message", None) or "").strip() or None
+    return Path(downloaded), media_kind, caption
 
 
 def format_bytes(value: int) -> str:
