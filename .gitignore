@@ -8,6 +8,7 @@ __pycache__/
 .venv*/
 .idea/
 .vscode/
+.deploy/
 .DS_Store
 *.log
 *.session
