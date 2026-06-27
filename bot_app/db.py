@@ -86,7 +86,7 @@ class Database:
         self,
         owner_tg_id: int,
         label: str,
-        phone: str,
+        phone: "<REDACTED>"
         session_encrypted: str,
     ) -> int:
         async with self.connect() as db:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import shutil
 import socket
 import uuid
 from datetime import datetime
@@ -58,9 +59,9 @@ QR_LOGIN_FLOWS: dict[int, dict[str, Any]] = {}
 
 
 class AddAccount(StatesGroup):
-    phone = State()
+    phone = "<REDACTED>"
     code = State()
-    password = State()
+    password = "<REDACTED>"
 
 
 class BindChannel(StatesGroup):
@@ -72,7 +73,7 @@ class UploadStory(StatesGroup):
 
 
 class QrAccount(StatesGroup):
-    password = State()
+    password = "<REDACTED>"
 
 
 async def run() -> None:
@@ -84,7 +85,7 @@ async def run() -> None:
     cipher = SessionCipher(config.fernet_key)
     bot_session_kwargs = {}
     if config.bot_api_base_url:
-        bot_session_kwargs["api"] = TelegramAPIServer.from_base(config.bot_api_base_url)
+        bot_session_kwargs["api"] = TelegramAPIServer.from_base(config.bot_api_base_url, is_local=True)
     bot_session = AiohttpSession(**bot_session_kwargs)
     bot_session._connector_init["family"] = socket.AF_INET
     bot = Bot(config.bot_token, session=bot_session)
@@ -284,7 +285,7 @@ async def add_account_phone(
     if not await require_admin_message(message, config):
         return
 
-    phone = (message.text or "").strip()
+    phone = "<REDACTED>"
     client = TelegramClient(
         StringSession(),
         config.api_id,
@@ -372,7 +373,7 @@ async def add_account_code(
 
     try:
         await client.sign_in(
-            phone=flow["phone"],
+            phone="<REDACTED>"
             code=code,
             phone_code_hash=flow["phone_code_hash"],
         )
@@ -797,10 +798,30 @@ async def upload_media(
             return
 
         try:
-            await bot.download(media, destination=destination)
+            if config.bot_api_base_url:
+                file_info = await bot.get_file(media.file_id)
+                file_path = Path(file_info.file_path)
+                if file_path.is_absolute():
+                    try:
+                        relative_file_path = file_path.relative_to("/var/lib/telegram-bot-api")
+                    except ValueError:
+                        relative_file_path = Path(config.bot_token) / file_path.name
+                else:
+                    relative_file_path = Path(config.bot_token) / file_path
+                local_file = Path("/opt/telegram-bot-api-data") / relative_file_path
+                if local_file.exists():
+                    shutil.copyfile(local_file, destination)
+                else:
+                    await bot.download(media, destination=destination)
+            else:
+                await bot.download(media, destination=destination)
         except TelegramBadRequest as exc:
             destination.unlink(missing_ok=True)
             await message.answer(f"Telegram не дал скачать файл: {exc.message}")
+            return
+        except FileNotFoundError as exc:
+            destination.unlink(missing_ok=True)
+            await message.answer(f"Не удалось найти файл после загрузки через локальный Bot API: {exc}")
             return
     else:
         await message.answer("Скачиваю исходник по ссылке через подключенный аккаунт.")
@@ -893,7 +914,7 @@ async def save_authorized_account(
     account_id = await db.add_account(
         owner_tg_id=message.from_user.id,
         label=label,
-        phone=flow["phone"],
+        phone="<REDACTED>"
         session_encrypted=cipher.encrypt(session_string),
     )
     await cleanup_login_flow(message.from_user.id)
@@ -913,11 +934,11 @@ async def save_authorized_client(
     me = await client.get_me()
     session_string = client.session.save()
     label = account_label(me)
-    phone = f"+{me.phone}" if getattr(me, "phone", None) else "qr-login"
+    phone = "<REDACTED>"
     return await db.add_account(
         owner_tg_id=owner_tg_id,
         label=label,
-        phone=phone,
+        phone="<REDACTED>"
         session_encrypted=cipher.encrypt(session_string),
     )
 

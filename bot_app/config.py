@@ -11,10 +11,10 @@ from dotenv import load_dotenv
 
 @dataclass(frozen=True)
 class Config:
-    bot_token: str
-    api_id: int
-    api_hash: str
-    admin_ids: set[int]
+    bot_token: "<REDACTED>"
+    api_id: "<REDACTED>"
+    api_hash: "<REDACTED>"
+    admin_ids: "<REDACTED>"
     fernet_key: str
     database_path: Path
     media_dir: Path
@@ -26,13 +26,13 @@ class Config:
     def from_env(cls) -> "Config":
         load_dotenv()
 
-        bot_token = _required("BOT_TOKEN")
-        api_id = int(_required("TELEGRAM_API_ID"))
-        api_hash = _required("TELEGRAM_API_HASH")
+        bot_token = "<REDACTED>"
+        api_id = "<REDACTED>"
+        api_hash = "<REDACTED>"
         fernet_key = _required("FERNET_KEY")
 
         admin_ids_raw = os.getenv("ADMIN_IDS", "").strip()
-        admin_ids = {
+        admin_ids = "<REDACTED>"
             int(item.strip())
             for item in admin_ids_raw.split(",")
             if item.strip()
@@ -45,10 +45,10 @@ class Config:
         bot_api_base_url = os.getenv("BOT_API_BASE_URL", "").strip() or None
 
         return cls(
-            bot_token=bot_token,
-            api_id=api_id,
-            api_hash=api_hash,
-            admin_ids=admin_ids,
+            bot_token="<REDACTED>"
+            api_id="<REDACTED>"
+            api_hash="<REDACTED>"
+            admin_ids="<REDACTED>"
             fernet_key=fernet_key,
             database_path=database_path,
             media_dir=media_dir,
@@ -77,7 +77,7 @@ class Config:
             raise RuntimeError("Invalid TELETHON_PROXY_URL format")
 
         username = unquote(parsed.username) if parsed.username else None
-        password = unquote(parsed.password) if parsed.password else None
+        password = "<REDACTED>"
         if username:
             return (proxy_type, parsed.hostname, parsed.port, True, username, password or "")
         return (proxy_type, parsed.hostname, parsed.port, True)

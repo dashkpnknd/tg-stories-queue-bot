@@ -13,10 +13,11 @@ from telethon import types
 MAX_STORY_BYTES = 30 * 1024 * 1024
 MAX_BOT_DOWNLOAD_BYTES = 20 * 1024 * 1024
 MAX_STORY_VIDEO_SECONDS = 60
-STORY_VIDEO_SPLIT_SECONDS = 59
-VIDEO_TARGET_BITRATE = "4000k"
-VIDEO_TARGET_BUFSIZE = "8000k"
-VIDEO_CRF = "20"
+STORY_VIDEO_SPLIT_SECONDS = 60
+STORY_TARGET_BYTES = int(28.5 * 1024 * 1024)
+VIDEO_AUDIO_BITRATE_K = 128
+VIDEO_MIN_BITRATE_K = 1800
+VIDEO_MAX_BITRATE_K = 3900
 
 
 async def build_story_media(client, media_path: str, media_kind: str):
@@ -120,7 +121,15 @@ def split_story_video(path: Path, output_dir: Path, max_seconds: int = STORY_VID
     return parts
 
 
+def target_video_bitrate_k(duration: int) -> int:
+    total_k = int((STORY_TARGET_BYTES * 8) / max(1, duration) / 1000)
+    video_k = total_k - VIDEO_AUDIO_BITRATE_K
+    return max(VIDEO_MIN_BITRATE_K, min(VIDEO_MAX_BITRATE_K, video_k))
+
+
 def normalize_video_command(source: Path, output: Path, start: int, duration: int) -> list[str]:
+    video_bitrate = f"{target_video_bitrate_k(duration)}k"
+    audio_bitrate = f"{VIDEO_AUDIO_BITRATE_K}k"
     return [
         "ffmpeg",
         "-y",
@@ -138,27 +147,27 @@ def normalize_video_command(source: Path, output: Path, start: int, duration: in
         "-map",
         "0:a?",
         "-vf",
-        "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30",
+        "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30",
         "-c:v",
-        "libx264",
+        "libx265",
         "-preset",
-        "medium",
-        "-profile:v",
-        "high",
-        "-level",
-        "4.1",
-        "-crf",
-        VIDEO_CRF,
+        "slow",
+        "-tag:v",
+        "hvc1",
+        "-x265-params",
+        "keyint=30:min-keyint=30:scenecut=0",
+        "-b:v",
+        video_bitrate,
         "-maxrate",
-        VIDEO_TARGET_BITRATE,
+        video_bitrate,
         "-bufsize",
-        VIDEO_TARGET_BUFSIZE,
+        f"{target_video_bitrate_k(duration) * 2}k",
         "-pix_fmt",
         "yuv420p",
         "-c:a",
         "aac",
         "-b:a",
-        "160k",
+        audio_bitrate,
         "-ar",
         "44100",
         "-movflags",
