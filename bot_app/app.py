@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import random
+import re
 import shutil
 import socket
 import uuid
-from datetime import datetime
+from datetime import datetime, time as clock_time, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -48,20 +50,24 @@ from bot_app.media import (
 from bot_app.scheduler import StoryScheduler
 from bot_app.security import SessionCipher
 from bot_app.source_links import TelegramMessageLink, parse_telegram_message_link
-from bot_app.telegram_stories import ALLOWED_PERIOD_HOURS, user_client
+from bot_app.telegram_stories import (
+    ALLOWED_PERIOD_HOURS, archived_story_media_kind, get_own_stories, user_client,
+)
 
 logger = logging.getLogger(__name__)
 router = Router()
 DISPLAY_TZ = ZoneInfo("Europe/Moscow")
+STORY_PUBLISH_START = clock_time(10, 0)
+STORY_PUBLISH_END = clock_time(15, 0)
 
 LOGIN_FLOWS: dict[int, dict[str, Any]] = {}
 QR_LOGIN_FLOWS: dict[int, dict[str, Any]] = {}
 
 
 class AddAccount(StatesGroup):
-    phone = "<REDACTED>"
+    phone = State()
     code = State()
-    password = "<REDACTED>"
+    password = State()
 
 
 class BindChannel(StatesGroup):
@@ -73,7 +79,11 @@ class UploadStory(StatesGroup):
 
 
 class QrAccount(StatesGroup):
-    password = "<REDACTED>"
+    password = State()
+
+
+class ArchiveSelection(StatesGroup):
+    ids = State()
 
 
 async def run() -> None:
@@ -122,13 +132,88 @@ async def start(message: Message, config: Config, state: FSMContext) -> None:
 
 
 @router.message(Command("cancel"))
-async def cancel(message: Message, config: Config, state: FSMContext) -> None:
+async def discard_upload_draft(state: FSMContext, db: Database) -> None:
+    data = await state.get_data()
+    campaign_id = data.get("campaign_id")
+    if not campaign_id:
+        return
+    for raw_path in await db.discard_draft_campaign(str(campaign_id)):
+        Path(raw_path).unlink(missing_ok=True)
+
+
+async def cancel(message: Message, config: Config, state: FSMContext, db: Database) -> None:
     if not await require_admin_message(message, config):
         return
     await cleanup_login_flow(message.from_user.id if message.from_user else 0)
     await cleanup_qr_login_flow(message.from_user.id if message.from_user else 0)
+    await discard_upload_draft(state, db)
     await state.clear()
     await message.answer("Ок, текущее действие отменено.", reply_markup=main_menu())
+
+
+def random_story_timestamp(day, *, not_before: datetime | None = None) -> int | None:
+    """Choose an exact random second inside 10:00–15:00 Moscow time."""
+    start = datetime.combine(day, STORY_PUBLISH_START, tzinfo=DISPLAY_TZ)
+    end = datetime.combine(day, STORY_PUBLISH_END, tzinfo=DISPLAY_TZ)
+    if not_before:
+        start = max(start, not_before.astimezone(DISPLAY_TZ))
+    if start >= end:
+        return None
+    return random.randrange(int(start.timestamp()), int(end.timestamp()))
+
+
+def make_random_campaign_schedule(batch_ids: list[str], now: int) -> list[tuple[str, int]]:
+    """Shuffle stories once; each next slot is one or two days later."""
+    ordered = list(batch_ids)
+    random.shuffle(ordered)
+    current = datetime.fromtimestamp(now, DISPLAY_TZ)
+    first = random_story_timestamp(current.date(), not_before=current + timedelta(minutes=5))
+    if first is None:
+        first = random_story_timestamp(current.date() + timedelta(days=1))
+    assert first is not None
+    result = [(ordered[0], first)]
+    previous = datetime.fromtimestamp(first, DISPLAY_TZ)
+    for batch_id in ordered[1:]:
+        next_day = previous.date() + timedelta(days=random.choice((1, 2)))
+        scheduled = random_story_timestamp(next_day)
+        assert scheduled is not None
+        result.append((batch_id, scheduled))
+        previous = datetime.fromtimestamp(scheduled, DISPLAY_TZ)
+    return result
+
+
+def parse_story_selection(text: str, username: str | None) -> list[int]:
+    """Accept own-story links, IDs and inclusive ranges without duplicates."""
+    result: list[int] = []
+    seen: set[int] = set()
+    for token in re.split(r"[\s,;]+", text.strip()):
+        if not token:
+            continue
+        link = re.fullmatch(r"https?://(?:www\.)?t\.me/([A-Za-z0-9_]+)/s/(\d+)/?(?:\?.*)?", token)
+        if link:
+            if not username or link.group(1).casefold() != username.casefold():
+                raise ValueError("Ссылка ведёт на другой аккаунт. Пришли ссылку на выбранный аккаунт или ID Story.")
+            values = [int(link.group(2))]
+        elif re.fullmatch(r"\d+[-–]\d+", token):
+            first, last = map(int, re.split(r"[-–]", token))
+            if first > last or last - first >= 500:
+                raise ValueError("Диапазон должен идти по возрастанию и содержать не больше 500 историй.")
+            values = range(first, last + 1)
+        elif token.isdecimal():
+            values = [int(token)]
+        else:
+            raise ValueError(f"Не поняла «{token[:60]}». Нужны ссылки, ID или диапазон вроде 12-18.")
+        for story_id in values:
+            if story_id <= 0:
+                raise ValueError("ID истории должен быть положительным числом.")
+            if story_id not in seen:
+                result.append(story_id)
+                seen.add(story_id)
+            if len(result) > 500:
+                raise ValueError("За один раз можно выбрать не больше 500 историй.")
+    if not result:
+        raise ValueError("Пришли хотя бы один ID или ссылку на историю.")
+    return result
 
 
 @router.message(Command("accounts"))
@@ -146,11 +231,12 @@ async def queue_command(message: Message, config: Config, db: Database) -> None:
 
 
 @router.callback_query(F.data == "menu")
-async def menu_callback(callback: CallbackQuery, config: Config, state: FSMContext) -> None:
+async def menu_callback(callback: CallbackQuery, config: Config, state: FSMContext, db: Database) -> None:
     if not await require_admin_callback(callback, config):
         return
     await cleanup_login_flow(callback.from_user.id)
     await cleanup_qr_login_flow(callback.from_user.id)
+    await discard_upload_draft(state, db)
     await state.clear()
     await callback.message.edit_text("Главное меню:", reply_markup=main_menu())
     await callback.answer()
@@ -285,7 +371,7 @@ async def add_account_phone(
     if not await require_admin_message(message, config):
         return
 
-    phone = "<REDACTED>"
+    phone = (message.text or "").strip()
     client = TelegramClient(
         StringSession(),
         config.api_id,
@@ -373,7 +459,7 @@ async def add_account_code(
 
     try:
         await client.sign_in(
-            phone="<REDACTED>"
+            phone=flow["phone"],
             code=code,
             phone_code_hash=flow["phone_code_hash"],
         )
@@ -431,6 +517,158 @@ async def account_detail_callback(callback: CallbackQuery, config: Config, db: D
     await callback.message.edit_text(
         await format_account_text(db, account),
         reply_markup=account_keyboard(account),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("archive_select:"))
+async def archive_select_callback(
+    callback: CallbackQuery, config: Config, db: Database, state: FSMContext,
+) -> None:
+    if not await require_admin_callback(callback, config):
+        return
+    account_id = int(callback.data.split(":")[1])
+    account = await db.get_account(account_id)
+    if not account or account["owner_tg_id"] != callback.from_user.id:
+        await callback.answer("Аккаунт не найден.", show_alert=True)
+        return
+    if await db.has_queued_items(account_id):
+        await callback.answer("Сначала дождись завершения очереди этого аккаунта.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(ArchiveSelection.ids)
+    await state.update_data(account_id=account_id)
+    await callback.message.edit_text(
+        f"Выбран аккаунт: {account['label']}\n\n"
+        "Пришли ссылки на свои старые Story, их ID или диапазон, например 12-18. "
+        "Можно несколько строк. Бот проверит каждую и покажет черновик перед запуском.\n\n"
+        "Истории будут выходить только в этот аккаунт, на 48 часов, без закрепления в профиле.",
+        reply_markup=archive_cancel_keyboard(account_id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("archive_cancel:"))
+async def archive_cancel_callback(
+    callback: CallbackQuery, config: Config, db: Database, state: FSMContext,
+) -> None:
+    if not await require_admin_callback(callback, config):
+        return
+    account_id = int(callback.data.split(":")[1])
+    account = await db.get_account(account_id)
+    if not account or account["owner_tg_id"] != callback.from_user.id:
+        await callback.answer("Аккаунт не найден.", show_alert=True)
+        return
+    await state.clear()
+    await callback.message.edit_text(
+        await format_account_text(db, account), reply_markup=account_keyboard(account)
+    )
+    await callback.answer()
+
+
+@router.message(ArchiveSelection.ids)
+async def archive_selection_message(
+    message: Message, config: Config, db: Database, cipher: SessionCipher,
+    state: FSMContext,
+) -> None:
+    if not await require_admin_message(message, config):
+        return
+    data = await state.get_data()
+    account_id = int(data["account_id"])
+    account = await db.get_account(account_id)
+    if not account or account["owner_tg_id"] != message.from_user.id:
+        await state.clear()
+        await message.answer("Аккаунт не найден.", reply_markup=main_menu())
+        return
+    if await db.has_queued_items(account_id):
+        await message.answer("У этого аккаунта уже есть очередь. Дождись её завершения.")
+        return
+    try:
+        session = cipher.decrypt(account["session_encrypted"])
+        async with user_client(config.api_id, config.api_hash, session,
+                               proxy=config.telethon_proxy()) as client:
+            me = await client.get_me()
+            if not getattr(me, "premium", False):
+                raise ValueError("Для 48-часовых Story этому аккаунту нужен Telegram Premium.")
+            selected_ids = parse_story_selection(message.text or "", getattr(me, "username", None))
+            found = {}
+            for index in range(0, len(selected_ids), 100):
+                found.update(await get_own_stories(client, selected_ids[index:index + 100]))
+            missing = [story_id for story_id in selected_ids if story_id not in found]
+            if missing:
+                raise ValueError(
+                    "Не нашла в этом аккаунте Story с ID: "
+                    + ", ".join(map(str, missing[:15]))
+                )
+            stories = [
+                (story_id, archived_story_media_kind(found[story_id]),
+                 getattr(found[story_id], "caption", None))
+                for story_id in selected_ids
+            ]
+    except Exception as exc:
+        await message.answer(f"Не удалось собрать черновик: {exc}")
+        return
+    await state.update_data(archive_stories=stories)
+    preview = ", ".join(str(story_id) for story_id in selected_ids[:25])
+    if len(selected_ids) > 25:
+        preview += f" … и ещё {len(selected_ids) - 25}"
+    await message.answer(
+        f"Черновик для {account['label']}: {len(stories)} Story.\n"
+        f"Исходные ID: {preview}\n\n"
+        "После запуска порядок перемешается один раз, без повторов. "
+        "Первая публикация — сегодня до 15:00 МСК, если окно ещё открыто, "
+        "иначе завтра. Затем случайно через 1 или 2 дня, с 10:00 до 15:00 МСК. "
+        "Канал не используется; в профиль по истечении 48 часов истории не закрепляются.",
+        reply_markup=archive_draft_keyboard(account_id),
+    )
+
+
+@router.callback_query(F.data.startswith("archive_start:"))
+async def archive_start_callback(
+    callback: CallbackQuery, config: Config, db: Database, cipher: SessionCipher,
+    state: FSMContext,
+) -> None:
+    if not await require_admin_callback(callback, config):
+        return
+    account_id = int(callback.data.split(":")[1])
+    data = await state.get_data()
+    stories = data.get("archive_stories")
+    if int(data.get("account_id") or 0) != account_id or not stories:
+        await callback.answer("Черновик потерялся. Выбери истории заново.", show_alert=True)
+        return
+    account = await db.get_account(account_id)
+    if not account or account["owner_tg_id"] != callback.from_user.id:
+        await callback.answer("Аккаунт не найден.", show_alert=True)
+        return
+    try:
+        session = cipher.decrypt(account["session_encrypted"])
+        async with user_client(config.api_id, config.api_hash, session,
+                               proxy=config.telethon_proxy()) as client:
+            me = await client.get_me()
+            if not getattr(me, "premium", False):
+                raise ValueError("Для 48-часовых Story этому аккаунту нужен Telegram Premium.")
+            selected_ids = [int(story_id) for story_id, _, _ in stories]
+            for index in range(0, len(selected_ids), 100):
+                found = await get_own_stories(client, selected_ids[index:index + 100])
+                if len(found) != len(selected_ids[index:index + 100]):
+                    raise ValueError("Часть исходных историй больше недоступна. Собери черновик заново.")
+        raw_schedule = make_random_campaign_schedule([str(sid) for sid in selected_ids], now_ts())
+        schedule = [(int(sid), at) for sid, at in raw_schedule]
+        created = await db.create_archive_campaign(
+            callback.from_user.id, account_id, stories, schedule
+        )
+        if not created:
+            raise ValueError("У аккаунта уже есть очередь или черновик. Эта кампания не запущена.")
+    except Exception as exc:
+        await callback.answer(str(exc)[:180], show_alert=True)
+        return
+    await state.clear()
+    await callback.message.edit_text(
+        f"✅ Отдельная очередь из архива запущена для {account['label']}: {len(stories)} Story.\n\n"
+        f"Первая публикация: {format_ts_msk(schedule[0][1])}.\n"
+        "Дальше — случайно через 1 или 2 дня, в 10:00–15:00 МСК. "
+        "Каждая Story живёт 48 часов и затем остаётся только в личном архиве.",
+        reply_markup=main_menu(),
     )
     await callback.answer()
 
@@ -719,8 +957,30 @@ async def upload_account_callback(callback: CallbackQuery, config: Config, db: D
         await callback.answer("Аккаунт не найден.", show_alert=True)
         return
     await callback.message.edit_text(
-        "На сколько часов поставить Story?",
-        reply_markup=period_keyboard(account_id),
+        "Истории будут жить 48 часов. Пачка один раз перемешается без повторов.\n\n"
+        "Первая история выйдет сегодня в случайное время с 10:00 до 15:00 МСК, "
+        "если это окно ещё не закончилось; иначе — завтра. Каждая следующая выйдет "
+        "случайно через 1 или 2 дня, тоже с 10:00 до 15:00 МСК.",
+        reply_markup=random_campaign_keyboard(account_id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("upload_random:"))
+async def upload_random_callback(callback: CallbackQuery, config: Config, state: FSMContext) -> None:
+    if not await require_admin_callback(callback, config):
+        return
+    account_id = int(callback.data.split(":")[1])
+    await state.set_state(UploadStory.media)
+    await state.update_data(
+        account_id=account_id,
+        period_hours=48,
+        campaign_id=uuid.uuid4().hex,
+    )
+    await callback.message.edit_text(
+        "Пришли всю пачку фото/видео. Порядок не важен: бот перемешает истории без повторов.\n\n"
+        "После каждой загрузки продолжай присылать контент. Когда закончишь, нажми «Запустить случайную очередь».",
+        reply_markup=upload_draft_keyboard(),
     )
     await callback.answer()
 
@@ -755,6 +1015,7 @@ async def upload_media(
     data = await state.get_data()
     account_id = int(data["account_id"])
     period_hours = int(data["period_hours"])
+    campaign_id = str(data.get("campaign_id") or uuid.uuid4().hex)
     account = await db.get_account(account_id)
     if not account or account["owner_tg_id"] != message.from_user.id:
         await state.clear()
@@ -872,8 +1133,11 @@ async def upload_media(
         media_kind=media_kind,
         caption=caption,
         period_hours=period_hours,
+        campaign_id=campaign_id,
+        status="draft" if data.get("campaign_id") else "queued",
     )
-    await state.clear()
+    if not data.get("campaign_id"):
+        await state.clear()
     if len(item_ids) == 1:
         queue_text = f"Добавлено в очередь: #{item_ids[0]}."
     else:
@@ -881,13 +1145,56 @@ async def upload_media(
             f"Добавлено в очередь: #{item_ids[0]}-#{item_ids[-1]} "
             f"({len(item_ids)} части)."
         )
+    if data.get("campaign_id"):
+        count = len(await db.draft_campaign_batches(campaign_id))
+        await message.answer(
+            f"{queue_text} Черновик: {count} Story. Можешь прислать ещё или запустить очередь.",
+            reply_markup=upload_draft_keyboard(),
+        )
+        return
+
     batches = await db.queued_batches_for_account(account_id)
     expected_at = estimate_batch_publish_at(account, batches, item_ids[0])
     publish_hint = format_upload_publish_hint(expected_at)
-    await message.answer(
-        f"{queue_text} {publish_hint}",
+    await message.answer(f"{queue_text} {publish_hint}", reply_markup=main_menu())
+
+
+@router.callback_query(F.data == "upload_finish")
+async def upload_finish_callback(callback: CallbackQuery, config: Config, db: Database, state: FSMContext) -> None:
+    if not await require_admin_callback(callback, config):
+        return
+    data = await state.get_data()
+    campaign_id = data.get("campaign_id")
+    account_id = data.get("account_id")
+    if not campaign_id or not account_id:
+        await callback.answer("Нет открытой пачки. Начни через «Добавить контент».", show_alert=True)
+        return
+    batch_ids = await db.draft_campaign_batches(str(campaign_id))
+    schedule = make_random_campaign_schedule(batch_ids, now_ts()) if batch_ids else []
+    activated = await db.activate_random_campaign(str(campaign_id), int(account_id), schedule)
+    if not activated:
+        await callback.answer("Пачка пуста или уже запущена.", show_alert=True)
+        return
+    await state.clear()
+    first_at = min(timestamp for _batch_id, timestamp in schedule)
+    await callback.message.edit_text(
+        f"✅ Случайная очередь запущена: {len(schedule)} Story, без повторов.\n\n"
+        f"Первая публикация: {format_ts_msk(first_at)}.\n"
+        "Дальше — случайно через 1 или 2 дня, в окне 10:00–15:00 МСК. Каждая Story живёт 48 часов.",
         reply_markup=main_menu(),
     )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "upload_cancel")
+async def upload_cancel_callback(callback: CallbackQuery, config: Config, db: Database, state: FSMContext) -> None:
+    if not await require_admin_callback(callback, config):
+        return
+    data = await state.get_data()
+    await discard_upload_draft(state, db)
+    await state.clear()
+    await callback.message.edit_text("Пачка отменена. Её файлы удалены с сервера.", reply_markup=main_menu())
+    await callback.answer()
 
 
 @router.callback_query(F.data == "queue")
@@ -914,7 +1221,7 @@ async def save_authorized_account(
     account_id = await db.add_account(
         owner_tg_id=message.from_user.id,
         label=label,
-        phone="<REDACTED>"
+        phone=flow["phone"],
         session_encrypted=cipher.encrypt(session_string),
     )
     await cleanup_login_flow(message.from_user.id)
@@ -934,11 +1241,11 @@ async def save_authorized_client(
     me = await client.get_me()
     session_string = client.session.save()
     label = account_label(me)
-    phone = "<REDACTED>"
+    phone = f"+{me.phone}" if getattr(me, "phone", None) else "qr-login"
     return await db.add_account(
         owner_tg_id=owner_tg_id,
         label=label,
-        phone="<REDACTED>"
+        phone=phone,
         session_encrypted=cipher.encrypt(session_string),
     )
 
@@ -1093,6 +1400,7 @@ def account_keyboard(account) -> InlineKeyboardMarkup:
         ]
     )
     rows.append([InlineKeyboardButton(text="Следующая Story", callback_data=f"next_story:{account_id}")])
+    rows.append([InlineKeyboardButton(text="Истории из своего архива", callback_data=f"archive_select:{account_id}")])
     rows.append([InlineKeyboardButton(text="Опубликовать следующую сейчас", callback_data=f"publish_now:{account_id}")])
     rows.append([InlineKeyboardButton(text="Удалить аккаунт", callback_data=f"delete_account:{account_id}")])
     rows.append([InlineKeyboardButton(text="Назад", callback_data="accounts")])
@@ -1115,18 +1423,37 @@ async def upload_accounts_keyboard(db: Database, owner_tg_id: int) -> InlineKeyb
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def period_keyboard(account_id: int) -> InlineKeyboardMarkup:
+def random_campaign_keyboard(account_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(text="6 ч", callback_data=f"upload_period:{account_id}:6"),
-                InlineKeyboardButton(text="12 ч", callback_data=f"upload_period:{account_id}:12"),
-            ],
-            [
-                InlineKeyboardButton(text="24 ч", callback_data=f"upload_period:{account_id}:24"),
-                InlineKeyboardButton(text="48 ч", callback_data=f"upload_period:{account_id}:48"),
-            ],
+            [InlineKeyboardButton(text="🎲 Создать случайную очередь на 48 ч", callback_data=f"upload_random:{account_id}")],
             [InlineKeyboardButton(text="Назад", callback_data="upload")],
+        ]
+    )
+
+
+def upload_draft_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Запустить случайную очередь", callback_data="upload_finish")],
+            [InlineKeyboardButton(text="✖️ Отменить пачку", callback_data="upload_cancel")],
+        ]
+    )
+
+
+def archive_draft_keyboard(account_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Запустить очередь из архива", callback_data=f"archive_start:{account_id}")],
+            [InlineKeyboardButton(text="✖️ Отменить", callback_data=f"archive_cancel:{account_id}")],
+        ]
+    )
+
+
+def archive_cancel_keyboard(account_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✖️ Отменить", callback_data=f"archive_cancel:{account_id}")],
         ]
     )
 
@@ -1150,12 +1477,15 @@ def channels_keyboard(account_id: int, channels: list[dict[str, Any]]) -> Inline
 
 async def format_account_text(db: Database, account) -> str:
     summary = await db.account_queue_summary(account["id"])
-    return format_account(account, summary)
+    scheduled_at = await db.next_scheduled_at(account["id"])
+    return format_account(account, summary, scheduled_at)
 
 
-def format_account(account, summary: dict[str, int] | None = None) -> str:
+def format_account(
+    account, summary: dict[str, int] | None = None, scheduled_at: int | None = None,
+) -> str:
     channel = format_channel_ref(account["channel_ref"]) if account["channel_ref"] else "не привязан"
-    next_publish_at = account["next_publish_at"]
+    next_publish_at = scheduled_at or account["next_publish_at"]
     next_text = (
         format_ts_msk(next_publish_at)
         if next_publish_at
@@ -1180,6 +1510,8 @@ def estimate_batch_publish_at(account, batches, target_first_id: int) -> int:
     next_publish_at = int(account["next_publish_at"] or 0)
     publish_at = max(next_publish_at, current + 60)
     for batch in batches:
+        if batch["scheduled_at"] is not None:
+            publish_at = int(batch["scheduled_at"])
         if int(batch["first_id"]) == target_first_id:
             return publish_at
         publish_at += int(batch["period_hours"]) * 3600
@@ -1235,10 +1567,14 @@ def format_queue(rows) -> str:
 
     lines = ["Актуальная очередь:"]
     for row in rows:
-        created = datetime.fromtimestamp(row["created_at"]).strftime("%Y-%m-%d %H:%M")
+        planned = (
+            format_ts_msk(row["scheduled_at"])
+            if row["scheduled_at"] is not None
+            else "сразу после освобождения аккаунта"
+        )
         lines.append(
             f"#{row['id']}{format_batch_part(row)} | {row['account_label']} | {row['media_kind']} | "
-            f"{row['period_hours']} ч | {created}"
+            f"{row['period_hours']} ч | {planned}"
         )
     return "\n".join(lines)
 

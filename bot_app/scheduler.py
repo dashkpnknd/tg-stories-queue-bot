@@ -11,7 +11,7 @@ from bot_app.config import Config
 from bot_app.db import Database, now_ts
 from bot_app.media import split_story_video
 from bot_app.security import SessionCipher
-from bot_app.telegram_stories import send_story, user_client
+from bot_app.telegram_stories import send_archived_story, send_story, user_client
 
 logger = logging.getLogger(__name__)
 DISPLAY_TZ = ZoneInfo("Europe/Moscow")
@@ -74,8 +74,14 @@ class StoryScheduler:
         has_user_story = any(result["user_story_id"] is not None for result in results)
         next_at = None
         if has_user_story:
-            next_at = now_ts() + int(item["period_hours"]) * 3600
-            await self.db.set_next_publish_at(account["id"], next_at)
+            if item["scheduled_at"] is not None:
+                # Random campaigns carry their own durable timestamps. Do not
+                # replace them with a fixed 48-hour cadence after a restart.
+                next_at = await self.db.next_scheduled_at(account["id"])
+                await self.db.set_next_publish_at(account["id"], None)
+            else:
+                next_at = now_ts() + int(item["period_hours"]) * 3600
+                await self.db.set_next_publish_at(account["id"], next_at)
 
         await self._notify_results(account, batch_items, results, next_at)
         logger.info(
@@ -85,6 +91,48 @@ class StoryScheduler:
         )
 
     async def _publish_one_item(self, client, account, item) -> dict[str, Any]:
+        source_story_id = item["source_story_id"] if "source_story_id" in item.keys() else None
+        if source_story_id is not None:
+            user_story_id = None
+            channel_story_id = None
+            try:
+                user_story_id = await asyncio.wait_for(
+                    send_archived_story(
+                        client, int(source_story_id), item["caption"], self.config.media_dir
+                    ),
+                    timeout=300,
+                )
+                if user_story_id is None:
+                    raise RuntimeError("Telegram не вернул ID новой Story; нужна проверка вручную")
+                if account["channel_ref"]:
+                    # Save the account publication before trying the channel.
+                    # A channel failure must never cause a second account post.
+                    await self.db.finish_item(
+                        item["id"], "partial", user_story_id, None,
+                        "Публикация в канал не завершена",
+                    )
+                    channel_story_id = await asyncio.wait_for(
+                        send_archived_story(
+                            client, int(source_story_id), item["caption"],
+                            self.config.media_dir, peer=account["channel_ref"],
+                        ),
+                        timeout=300,
+                    )
+                    if channel_story_id is None:
+                        raise RuntimeError("Telegram не вернул ID Story в канале; нужна проверка вручную")
+                await self.db.finish_item(
+                    item["id"], "published", user_story_id, channel_story_id, None
+                )
+                return self._result(item, "published", user_story_id, channel_story_id, None)
+            except Exception as exc:
+                error = str(exc)
+                status = "partial" if user_story_id is not None else "failed"
+                await self.db.finish_item(
+                    item["id"], status, user_story_id, channel_story_id, error
+                )
+                logger.exception("Failed to publish archived Story %s", source_story_id)
+                return self._result(item, status, user_story_id, channel_story_id, error)
+
         media_path = Path(item["media_path"])
         user_story_id = None
         channel_story_id = None
@@ -109,9 +157,15 @@ class StoryScheduler:
                 caption=item["caption"],
                 period_hours=item["period_hours"],
             )
+            if user_story_id is None:
+                raise RuntimeError("Telegram не вернул ID новой Story; нужна проверка вручную")
             logger.info("Published queued item %s to user story %s", item["id"], user_story_id)
 
             if account["channel_ref"]:
+                await self.db.finish_item(
+                    item["id"], "partial", user_story_id, None,
+                    "Публикация в канал не завершена",
+                )
                 channel_story_id, media_path = await self._send_story_with_retry(
                     client=client,
                     peer=account["channel_ref"],
@@ -120,21 +174,30 @@ class StoryScheduler:
                     caption=item["caption"],
                     period_hours=item["period_hours"],
                 )
-                logger.info(
-                    "Published queued item %s to channel story %s",
-                    item["id"],
-                    channel_story_id,
-                )
+                if channel_story_id is None:
+                    raise RuntimeError("Telegram не вернул ID Story в канале; нужна проверка вручную")
 
             await self.db.finish_item(item["id"], "published", user_story_id, channel_story_id, None)
+            self._remove_media_files(Path(item["media_path"]), media_path)
             return self._result(item, "published", user_story_id, channel_story_id, None)
 
         except Exception as exc:
             status = "partial" if user_story_id is not None else "failed"
             error = str(exc)
             await self.db.finish_item(item["id"], status, user_story_id, channel_story_id, error)
+            if user_story_id is not None:
+                self._remove_media_files(Path(item["media_path"]), media_path)
             logger.exception("Failed to publish queued item %s", item["id"])
             return self._result(item, status, user_story_id, channel_story_id, error)
+
+    @staticmethod
+    def _remove_media_files(original_path: Path, prepared_path: Path) -> None:
+        """A published item must not leave its upload or normalized copy behind."""
+        for path in {original_path, prepared_path}:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Could not remove published media file %s", path, exc_info=True)
 
     async def _send_story_with_retry(
         self,
@@ -213,13 +276,8 @@ class StoryScheduler:
         item,
         user_story_id: int | None,
         channel_story_id: int | None,
+        next_at: int | None,
     ) -> None:
-        next_at = now_ts() + int(item["period_hours"]) * 3600
-        channel_text = (
-            f"канал: да, story_id={channel_story_id}"
-            if account["channel_ref"]
-            else "канал: не привязан"
-        )
         await self._send_owner_message(
             int(item["owner_tg_id"]),
             "\n".join(
@@ -228,9 +286,9 @@ class StoryScheduler:
                     f"очередь: #{item['id']}",
                     f"аккаунт: {account['label']}",
                     f"аккаунт story_id: {user_story_id}",
-                    channel_text,
+                    f"канал story_id: {channel_story_id}" if channel_story_id else "канал: не подключён",
                     f"срок: {item['period_hours']} ч",
-                    f"следующая публикация после: {format_ts(next_at)}",
+                    f"следующая публикация: {format_ts(next_at)}" if next_at else "очередь завершена",
                 ]
             ),
         )
@@ -286,6 +344,7 @@ class StoryScheduler:
                     item,
                     result["user_story_id"],
                     result["channel_story_id"],
+                    next_at,
                 )
             elif result["status"] == "partial":
                 await self._notify_partial(
@@ -296,6 +355,11 @@ class StoryScheduler:
                 )
             else:
                 await self._notify_failure(account, item, result["error"] or "unknown error")
+            if result["status"] == "published" and not await self.db.has_queued_items(account["id"]):
+                await self._send_owner_message(
+                    int(item["owner_tg_id"]),
+                    f"✅ Очередь для аккаунта {account['label']} пуста. Добавь новую пачку, когда будет контент.",
+                )
             return
 
         published = [result for result in results if result["user_story_id"] is not None]
@@ -318,15 +382,8 @@ class StoryScheduler:
             "аккаунт story_id: "
             + ", ".join(str(result["user_story_id"]) for result in published if result["user_story_id"]),
         ]
-        if account["channel_ref"]:
-            channel_ids = [
-                str(result["channel_story_id"])
-                for result in results
-                if result["channel_story_id"] is not None
-            ]
-            lines.append("канал story_id: " + (", ".join(channel_ids) if channel_ids else "нет"))
-        else:
-            lines.append("канал: не привязан")
+        channel_ids = [str(result["channel_story_id"]) for result in results if result["channel_story_id"]]
+        lines.append("канал story_id: " + ", ".join(channel_ids) if channel_ids else "канал: не подключён")
         lines.append(f"срок: {items[0]['period_hours']} ч")
         if next_at:
             lines.append(f"следующая публикация после: {format_ts(next_at)}")
@@ -336,6 +393,14 @@ class StoryScheduler:
                 lines.append(f"#{result['item_id']}: {result['error']}")
 
         await self._send_owner_message(int(items[0]["owner_tg_id"]), "\n".join(lines))
+
+        # A final positive confirmation is more useful than silently ending
+        # the batch: it tells the operator that new content can be added.
+        if all(result["status"] == "published" for result in results) and not await self.db.has_queued_items(account["id"]):
+            await self._send_owner_message(
+                int(items[0]["owner_tg_id"]),
+                f"✅ Очередь для аккаунта {account['label']} пуста. Добавь новую пачку, когда будет контент.",
+            )
 
 
 def format_ts(timestamp: int) -> str:

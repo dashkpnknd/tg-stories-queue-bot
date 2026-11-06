@@ -50,6 +50,8 @@ class Database:
                     batch_id TEXT,
                     batch_order INTEGER NOT NULL DEFAULT 1,
                     batch_total INTEGER NOT NULL DEFAULT 1,
+                    campaign_id TEXT,
+                    scheduled_at INTEGER,
                     FOREIGN KEY(account_id) REFERENCES accounts(id)
                 );
 
@@ -75,6 +77,12 @@ class Database:
             await db.execute(
                 "ALTER TABLE queued_items ADD COLUMN batch_total INTEGER NOT NULL DEFAULT 1"
             )
+        if "campaign_id" not in columns:
+            await db.execute("ALTER TABLE queued_items ADD COLUMN campaign_id TEXT")
+        if "scheduled_at" not in columns:
+            await db.execute("ALTER TABLE queued_items ADD COLUMN scheduled_at INTEGER")
+        if "source_story_id" not in columns:
+            await db.execute("ALTER TABLE queued_items ADD COLUMN source_story_id INTEGER")
 
     @asynccontextmanager
     async def connect(self) -> AsyncIterator[aiosqlite.Connection]:
@@ -86,7 +94,7 @@ class Database:
         self,
         owner_tg_id: int,
         label: str,
-        phone: "<REDACTED>"
+        phone: str,
         session_encrypted: str,
     ) -> int:
         async with self.connect() as db:
@@ -161,6 +169,8 @@ class Database:
         batch_id: str | None = None,
         batch_order: int = 1,
         batch_total: int = 1,
+        campaign_id: str | None = None,
+        status: str = "queued",
     ) -> int:
         batch_id = batch_id or uuid.uuid4().hex
         async with self.connect() as db:
@@ -168,8 +178,8 @@ class Database:
                 """
                 INSERT INTO queued_items
                     (owner_tg_id, account_id, media_path, media_kind, caption,
-                     period_hours, created_at, batch_id, batch_order, batch_total)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     period_hours, status, created_at, batch_id, batch_order, batch_total, campaign_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     owner_tg_id,
@@ -178,10 +188,12 @@ class Database:
                     media_kind,
                     caption,
                     period_hours,
+                    status,
                     now_ts(),
                     batch_id,
                     batch_order,
                     batch_total,
+                    campaign_id,
                 ),
             )
             await db.commit()
@@ -195,6 +207,8 @@ class Database:
         media_kind: str,
         caption: str | None,
         period_hours: int,
+        campaign_id: str | None = None,
+        status: str = "queued",
     ) -> list[int]:
         batch_id = uuid.uuid4().hex
         total = len(media_paths)
@@ -211,6 +225,8 @@ class Database:
                     batch_id=batch_id,
                     batch_order=index,
                     batch_total=total,
+                    campaign_id=campaign_id,
+                    status=status,
                 )
             )
         return item_ids
@@ -238,7 +254,7 @@ class Database:
                 SELECT *
                 FROM queued_items
                 WHERE account_id = ? AND status = 'queued'
-                ORDER BY created_at ASC
+                ORDER BY COALESCE(scheduled_at, created_at) ASC, id ASC
                 LIMIT 1
                 """,
                 (account_id,),
@@ -261,6 +277,100 @@ class Database:
                 (account_id, batch_id),
             )
             return await cursor.fetchall()
+
+    async def draft_campaign_batches(self, campaign_id: str) -> list[str]:
+        """Return story groups uploaded in one unfinished random batch."""
+        async with self.connect() as db:
+            cursor = await db.execute(
+                """
+                SELECT batch_id
+                FROM queued_items
+                WHERE campaign_id = ? AND status = 'draft'
+                GROUP BY batch_id
+                ORDER BY MIN(id) ASC
+                """,
+                (campaign_id,),
+            )
+            return [str(row["batch_id"]) for row in await cursor.fetchall()]
+
+    async def activate_random_campaign(
+        self, campaign_id: str, account_id: int, schedule: list[tuple[str, int]]
+    ) -> bool:
+        """Persist a shuffled schedule before any item becomes publishable."""
+        batch_ids = await self.draft_campaign_batches(campaign_id)
+        planned_ids = [batch_id for batch_id, _timestamp in schedule]
+        if not batch_ids or len(batch_ids) != len(schedule) or set(batch_ids) != set(planned_ids):
+            return False
+        async with self.connect() as db:
+            for batch_id, scheduled_at in schedule:
+                await db.execute(
+                    """
+                    UPDATE queued_items
+                    SET status = 'queued', scheduled_at = ?
+                    WHERE campaign_id = ? AND account_id = ? AND batch_id = ? AND status = 'draft'
+                    """,
+                    (scheduled_at, campaign_id, account_id, batch_id),
+                )
+            await db.execute("UPDATE accounts SET next_publish_at = NULL WHERE id = ?", (account_id,))
+            await db.commit()
+        return True
+
+    async def create_archive_campaign(
+        self,
+        owner_tg_id: int,
+        account_id: int,
+        stories: list[tuple[int, str, str | None]],
+        schedule: list[tuple[int, int]],
+    ) -> bool:
+        """Create a separate, fully scheduled campaign using Telegram story IDs."""
+        story_by_id = {story_id: (kind, caption) for story_id, kind, caption in stories}
+        if (not stories or len(story_by_id) != len(stories) or len(schedule) != len(stories)
+                or set(story_by_id) != {sid for sid, _ in schedule}):
+            return False
+        campaign_id = uuid.uuid4().hex
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT 1 FROM queued_items WHERE account_id = ? AND status IN ('queued', 'draft') LIMIT 1",
+                (account_id,),
+            )
+            if await cursor.fetchone():
+                await db.rollback()
+                return False
+            cursor = await db.execute(
+                "SELECT 1 FROM accounts WHERE id = ? AND owner_tg_id = ? AND is_active = 1",
+                (account_id, owner_tg_id),
+            )
+            if not await cursor.fetchone():
+                await db.rollback()
+                return False
+            for story_id, scheduled_at in schedule:
+                kind, caption = story_by_id[story_id]
+                await db.execute(
+                    """INSERT INTO queued_items
+                    (owner_tg_id, account_id, media_path, media_kind, caption,
+                     period_hours, status, created_at, batch_id, batch_order,
+                     batch_total, campaign_id, scheduled_at, source_story_id)
+                    VALUES (?, ?, '', ?, ?, 48, 'queued', ?, ?, 1, 1, ?, ?, ?)""",
+                    (owner_tg_id, account_id, kind, caption, now_ts(),
+                     uuid.uuid4().hex, campaign_id, scheduled_at, story_id),
+                )
+            await db.execute("UPDATE accounts SET next_publish_at = NULL WHERE id = ?", (account_id,))
+            await db.commit()
+        return True
+
+    async def discard_draft_campaign(self, campaign_id: str) -> list[str]:
+        """Drop only an unfinished upload and return its files for deletion."""
+        async with self.connect() as db:
+            cursor = await db.execute(
+                "SELECT media_path FROM queued_items WHERE campaign_id = ? AND status = 'draft'", (campaign_id,)
+            )
+            paths = [str(row["media_path"]) for row in await cursor.fetchall()]
+            await db.execute(
+                "DELETE FROM queued_items WHERE campaign_id = ? AND status = 'draft'", (campaign_id,)
+            )
+            await db.commit()
+            return paths
 
     async def queue_summary_by_account(self, owner_tg_id: int) -> dict[int, dict[str, int]]:
         async with self.connect() as db:
@@ -313,13 +423,14 @@ class Database:
                     MAX(id) AS last_id,
                     COUNT(*) AS parts_count,
                     MIN(created_at) AS created_at,
+                    MIN(scheduled_at) AS scheduled_at,
                     MIN(media_kind) AS media_kind,
                     MAX(CASE WHEN batch_order = 1 THEN caption ELSE NULL END) AS caption,
                     MAX(period_hours) AS period_hours
                 FROM queued_items
                 WHERE account_id = ? AND status = 'queued'
                 GROUP BY COALESCE(batch_id, 'single:' || id)
-                ORDER BY MIN(created_at) ASC, MIN(id) ASC
+                ORDER BY COALESCE(MIN(scheduled_at), MIN(created_at)) ASC, MIN(id) ASC
                 """,
                 (account_id,),
             )
@@ -335,10 +446,13 @@ class Database:
                 JOIN queued_items qi
                     ON qi.account_id = a.id AND qi.status = 'queued'
                 WHERE a.is_active = 1
-                  AND (a.next_publish_at IS NULL OR a.next_publish_at <= ?)
+                  AND (
+                    (qi.scheduled_at IS NOT NULL AND qi.scheduled_at <= ?)
+                    OR (qi.scheduled_at IS NULL AND (a.next_publish_at IS NULL OR a.next_publish_at <= ?))
+                  )
                 ORDER BY COALESCE(a.next_publish_at, 0), a.id
                 """,
-                (current,),
+                (current, current),
             )
             return await cursor.fetchall()
 
@@ -372,6 +486,36 @@ class Database:
                 (timestamp, account_id),
             )
             await db.commit()
+
+    async def next_scheduled_at(self, account_id: int) -> int | None:
+        async with self.connect() as db:
+            cursor = await db.execute(
+                """
+                SELECT MIN(scheduled_at) AS scheduled_at
+                FROM queued_items
+                WHERE account_id = ? AND status = 'queued' AND scheduled_at IS NOT NULL
+                """,
+                (account_id,),
+            )
+            row = await cursor.fetchone()
+            return int(row["scheduled_at"]) if row and row["scheduled_at"] is not None else None
+
+    async def has_queued_items(self, account_id: int) -> bool:
+        async with self.connect() as db:
+            cursor = await db.execute(
+                "SELECT 1 FROM queued_items WHERE account_id = ? AND status = 'queued' LIMIT 1",
+                (account_id,),
+            )
+            return await cursor.fetchone() is not None
+
+    async def clear_all_account_channels(self) -> int:
+        """Disable legacy channel reposting for every managed account."""
+        async with self.connect() as db:
+            cursor = await db.execute(
+                "UPDATE accounts SET channel_ref = NULL WHERE channel_ref IS NOT NULL"
+            )
+            await db.commit()
+            return int(cursor.rowcount)
 
 
 def now_ts() -> int:
