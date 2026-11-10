@@ -1,6 +1,6 @@
 # Telegram Stories Queue Bot
 
-> Архивная копия. Актуальная разработка — [tg-stories-manager](https://github.com/dashkpnknd/tg-stories-manager).
+> Отдельная копия. Актуальная разработка — [tg-stories-manager](https://github.com/dashkpnknd/tg-stories-manager).
 
 Бот-панель для Telegram, в которую можно подключать пользовательские аккаунты, опционально привязывать канал к аккаунту и складывать фото/видео в очередь Stories.
 
@@ -77,3 +77,7 @@ Environment=PYTHONUNBUFFERED=1
 [Install]
 WantedBy=multi-user.target
 ```
+
+## Связи и границы проекта
+
+Это отдельная копия проекта Stories. Основная разработка и серверная служба относятся к [tg-stories-manager](https://github.com/dashkpnknd/tg-stories-manager). Копию не следует запускать как второй экземпляр без отдельной задачи.
